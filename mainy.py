@@ -211,39 +211,43 @@ class ProxyPool:
             self._cycle = itertools.cycle(self.proxies)
 
     def _parse_line(self, line: str) -> Optional[dict]:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return None
+
         try:
             if "://" in line:
                 proto, rest = line.split("://", 1)
-                auth, host_port = rest.split("@") if "@" in rest else (None, rest)
-                host, port = host_port.split(":")
-                user, password = auth.split(":") if auth else (None, None)
-                return {
-                    "proxy_type": proto.lower(),
-                    "addr": host,
-                    "port": int(port),
-                    "username": user,
-                    "password": password,
-                }
-            parts = line.split(":")
-            if len(parts) == 4:
-                return {
-                    "proxy_type": "socks5",
-                    "addr": parts[0],
-                    "port": int(parts[1]),
-                    "username": parts[2],
-                    "password": parts[3],
-                }
-            elif len(parts) == 2:
-                return {
-                    "proxy_type": "socks5",
-                    "addr": parts[0],
-                    "port": int(parts[1]),
-                    "username": None,
-                    "password": None,
-                }
+            else:
+                proto = "socks5"
+                rest = line
+
+            user = None
+            password = None
+            if "@" in rest:
+                auth, host_port = rest.rsplit("@", 1)
+                if ":" in auth:
+                    user, password = auth.split(":", 1)
+                else:
+                    user = auth
+            else:
+                host_port = rest
+
+            if host_port.startswith("["):
+                host, port = host_port.rsplit("]:", 1)
+                host = host.strip("[]")
+            else:
+                host, port = host_port.rsplit(":", 1)
+
+            return {
+                "proxy_type": proto.lower(),
+                "addr": host,
+                "port": int(port),
+                "username": user,
+                "password": password,
+            }
         except Exception:
             return None
-        return None
 
     def get_next_proxy(self) -> Optional[dict]:
         if not self._cycle:
