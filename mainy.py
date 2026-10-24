@@ -446,12 +446,35 @@ class ActiveMigration:
 
 chat_semaphores: Dict[int, asyncio.Semaphore] = {}
 current_migration: Dict[int, ActiveMigration] = {}
+current_migrations_by_chat: Dict[int, Dict[str, ActiveMigration]] = {}
 queue_workers: Dict[int, bool] = {}
 
 stats = {"started": 0, "success": 0, "failed": 0, "cancelled": 0, "skipped": 0}
 
 
+def register_active_migration(mig: ActiveMigration):
+    current_migration[mig.chat_id] = mig
+    current_migrations_by_chat.setdefault(mig.chat_id, {})[mig.id] = mig
+
+
+def unregister_active_migration(mig: ActiveMigration):
+    chat_map = current_migrations_by_chat.get(mig.chat_id)
+    if chat_map and mig.id in chat_map:
+        del chat_map[mig.id]
+        if not chat_map:
+            current_migrations_by_chat.pop(mig.chat_id, None)
+
+    current = current_migration.get(mig.chat_id)
+    if current and current.id == mig.id:
+        remaining = current_migrations_by_chat.get(mig.chat_id)
+        if remaining:
+            current_migration[mig.chat_id] = next(iter(remaining.values()))
+        else:
+            current_migration.pop(mig.chat_id, None)
+
+
 # ====================== УТИЛИТЫ И ПРОВЕРКИ ======================
+
 
 def get_chat_semaphore(chat_id: int) -> asyncio.Semaphore:
     if chat_id not in chat_semaphores:
@@ -712,6 +735,7 @@ async def terminate_old_session(old_client: Optional[TelegramClient]) -> Tuple[b
 
 async def cleanup_migration(mig: ActiveMigration, state: Optional[FSMContext] = None):
     chat_id = mig.chat_id
+
     if chat_id in current_migration and current_migration[chat_id].id == mig.id:
         del current_migration[chat_id]
 
@@ -731,6 +755,8 @@ async def cleanup_migration(mig: ActiveMigration, state: Optional[FSMContext] = 
 
     if state and (mig.waiting_2fa or mig.waiting_manual_code):
         await state.clear()
+
+    unregister_active_migration(mig)
 
 
 async def clear_user_queue(chat_id: int, state: Optional[FSMContext] = None):
@@ -1247,7 +1273,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         proxy_config=proxy_dict,
         queue_db_id=item["id"],
     )
-    current_migration[chat_id] = mig
+    register_active_migration(mig)
     reporter = StatusReporter(status)
 
     try:
@@ -1466,7 +1492,7 @@ async def queue_worker(chat_id: int, bot: Bot, state: FSMContext):
                     await asyncio.sleep(0.3)
 
         mode = db.get_clean_mode(chat_id, settings.default_auto_code)
-        num_workers = settings.concurrent_workers_per_chat if mode == 2 else 1
+        num_workers = settings.concurrent_workers_per_chat
         tasks = [_worker_task() for _ in range(num_workers)]
         await asyncio.gather(*tasks)
 
@@ -1649,7 +1675,7 @@ async def process_phone(message: Message, state: FSMContext):
         waiting_manual_code=True,
         proxy_config=resolve_proxy(None),
     )
-    current_migration[chat_id] = mig
+    register_active_migration(mig)
 
     try:
         mig.temp_dir = Path(tempfile.mkdtemp(prefix=f"new_{chat_id}_{mig_id}_"))
