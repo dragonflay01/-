@@ -1297,7 +1297,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
                 f"❌ <b>{html.escape(orig_name)}</b>: не авторизована (сохранена в /failed).",
                 force=True,
             )
-            await cleanup_migration(mig)
+            await cleanup_migration(mig, state)
             return
 
         me = await old_client.get_me()
@@ -1309,7 +1309,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
                 f"❌ <b>{html.escape(orig_name)}</b>: нет номера (сохранена в /failed).",
                 force=True,
             )
-            await cleanup_migration(mig)
+            await cleanup_migration(mig, state)
             return
 
         phone = f"+{phone}" if not str(phone).startswith("+") else str(phone)
@@ -1343,6 +1343,8 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
             start_wait = time.time()
 
             while time.time() - start_wait < 90:
+                mig.last_activity = time.time()
+
                 if mig.skip_requested:
                     await cleanup_migration(mig, state)
                     return
@@ -1360,6 +1362,16 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
                 except Exception as e:
                     logger.debug(f"Ошибка чтения 777000: {e}")
 
+                if time.time() - start_wait > 20:
+                    try:
+                        await status.edit_text(
+                            f"📩 Код на <code>{html.escape(phone)}</code> ещё не пришёл.\n"
+                            "Проверяю 777000 и жду до таймаута.",
+                            reply_markup=action_kb(can_skip=True),
+                        )
+                    except Exception:
+                        pass
+
                 await asyncio.sleep(1.5)
 
             if not code:
@@ -1369,7 +1381,7 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
                     f"❌ Код от 777000 для <code>{html.escape(phone)}</code> не получен за 90 сек (в /failed).",
                     force=True,
                 )
-                await cleanup_migration(mig)
+                await cleanup_migration(mig, state)
                 return
 
         else:
@@ -1430,13 +1442,13 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
                 f"❌ Неверный или истекший код (<code>{code}</code>): {html.escape(str(e))}",
                 force=True,
             )
-            await cleanup_migration(mig)
+            await cleanup_migration(mig, state)
             return
         except Exception as e:
             save_to_quarantine(chat_id, old_session_path, orig_name, f"SIGN_IN_ERROR: {e}")
             stats["failed"] += 1
             await reporter.update(f"❌ Ошибка входа (в /failed): {html.escape(str(e))}", force=True)
-            await cleanup_migration(mig)
+            await cleanup_migration(mig, state)
             return
 
     except PhoneNumberBannedError:
@@ -1444,20 +1456,20 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
             save_to_quarantine(chat_id, mig.source_file_path, orig_name, "BANNED: Номер заблокирован")
         stats["failed"] += 1
         await reporter.update(f"❌ Номер <code>{html.escape(mig.phone)}</code> заблокирован (в /failed).", force=True)
-        await cleanup_migration(mig)
+        await cleanup_migration(mig, state)
     except UserDeactivatedError:
         if mig.source_file_path:
             save_to_quarantine(chat_id, mig.source_file_path, orig_name, "DEACTIVATED: Аккаунт удален")
         stats["failed"] += 1
         await reporter.update(f"❌ Аккаунт <code>{html.escape(mig.phone)}</code> деактивирован (в /failed).", force=True)
-        await cleanup_migration(mig)
+        await cleanup_migration(mig, state)
     except Exception as e:
         logger.exception("Ошибка process_one_session")
         if mig.source_file_path:
             save_to_quarantine(chat_id, mig.source_file_path, orig_name, f"ERROR: {e}")
         stats["failed"] += 1
         await reporter.update(f"❌ Сбой обработки (в /failed): {html.escape(str(e))}", force=True)
-        await cleanup_migration(mig)
+        await cleanup_migration(mig, state)
 
 
 # ====================== ВОРКЕР ОЧЕРЕДИ (6 ПОТОКОВ) ======================
@@ -1529,7 +1541,7 @@ async def cmd_start(message: Message, state: FSMContext):
         "• 🔄 <b>Миграция:</b> Перенос сессии в новую с ловлей кода и гарантированным Log Out старой\n"
         "• ⚡ <b>Fast Clean (7 потоков):</b> Мгновенная проверка и тотальная очистка параллельно в 7 потоков\n\n"
         "<b>Встроенные модули:</b>\n"
-        "• 🍉 <b>Авто-рефералка @GameUGSbot:</b> Вход по рефералке, подписка на каналы и решение фруктовой капчи после очистки\n"
+        "• 🍉 <b>Авто-рефералка @GameUGSbot:</b> Вход по рефералке, подписка на каналы и решение фруктовой капчи после [...]\n"
         "• 📦 <b>Карантин (/failed):</b> Сохранение всех проблемных сессий с логами ошибок в ZIP-архив\n"
         "• 🌐 <b>Proxy Pool:</b> Авто-подхват прокси из JSON или ротация из <code>proxies.txt</code>\n"
         "• 🔒 <b>Privacy Lockdown + 30d TTL + Очистка платежей</b>",
@@ -1918,18 +1930,37 @@ async def cmd_stats(message: Message):
 
 async def watchdog_task(bot: Bot):
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(10)
         now = time.time()
         timeout_sec = settings.session_timeout_minutes * 60
-        stale_chats = []
 
         for chat_id, mig in list(current_migration.items()):
-            if (mig.waiting_2fa or mig.waiting_manual_code) and (now - mig.last_activity > timeout_sec):
-                stale_chats.append(chat_id)
+            if not mig:
+                continue
 
-        for chat_id in stale_chats:
-            mig = current_migration.get(chat_id)
-            if mig:
+            if (mig.waiting_2fa or mig.waiting_manual_code) and (now - mig.last_activity > 20):
+                try:
+                    if mig.waiting_manual_code and mig.new_client and mig.phone:
+                        result = await mig.new_client.send_code_request(mig.phone)
+                        mig.phone_code_hash = result.phone_code_hash
+                        mig.last_activity = time.time()
+                        await bot.send_message(
+                            chat_id,
+                            f"⏳ Повторно отправляю код на <code>{html.escape(mig.phone)}</code>.\n"
+                            "Отправьте код подтверждения ещё раз.",
+                            parse_mode="HTML",
+                        )
+                    elif mig.waiting_2fa:
+                        mig.last_activity = time.time()
+                        await bot.send_message(
+                            chat_id,
+                            "⏳ Жду пароль 2FA. Отправьте его ещё раз.",
+                            parse_mode="HTML",
+                        )
+                except Exception as e:
+                    logger.warning(f"Ошибка повторного запроса для chat_id={chat_id}: {e}")
+
+            if (mig.waiting_2fa or mig.waiting_manual_code) and (now - mig.last_activity > timeout_sec):
                 logger.info(f"Таймаут сессии для chat_id {chat_id}")
                 try:
                     await bot.send_message(chat_id, "⌛ Время ожидания кода/2FA истекло. Сессия сброшена.")
