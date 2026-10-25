@@ -1288,19 +1288,47 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         mig.source_file_path = old_session_path
 
         old_client = get_configured_client(str(old_session_path.with_suffix("")), mig.fingerprint, mig.proxy_config)
-        await asyncio.wait_for(old_client.connect(), timeout=8.0)
-
-        if not await old_client.is_user_authorized():
-            save_to_quarantine(chat_id, old_session_path, orig_name, "UNAUTHORIZED: Сессия не авторизована")
-            stats["failed"] += 1
+        try:
+            await asyncio.wait_for(old_client.connect(), timeout=8.0)
+        except Exception as e:
+            logger.exception("old_client.connect() завис")
             await reporter.update(
-                f"❌ <b>{html.escape(orig_name)}</b>: не авторизована (сохранена в /failed).",
+                f"❌ Не удалось подключиться к старой сессии: <code>{html.escape(str(e))}</code>",
                 force=True,
             )
             await cleanup_migration(mig, state)
             return
 
-        me = await old_client.get_me()
+        try:
+            if not await old_client.is_user_authorized():
+                save_to_quarantine(chat_id, old_session_path, orig_name, "UNAUTHORIZED: Сессия не авторизована")
+                stats["failed"] += 1
+                await reporter.update(
+                    f"❌ <b>{html.escape(orig_name)}</b>: не авторизована (сохранена в /failed).",
+                    force=True,
+                )
+                await cleanup_migration(mig, state)
+                return
+        except Exception as e:
+            logger.exception("old_client.is_user_authorized() завис")
+            await reporter.update(
+                f"❌ Ошибка проверки старой сессии: <code>{html.escape(str(e))}</code>",
+                force=True,
+            )
+            await cleanup_migration(mig, state)
+            return
+
+        try:
+            me = await asyncio.wait_for(old_client.get_me(), timeout=12.0)
+        except Exception as e:
+            logger.exception("old_client.get_me() завис")
+            await reporter.update(
+                f"❌ Не удалось получить данные старой сессии: <code>{html.escape(str(e))}</code>",
+                force=True,
+            )
+            await cleanup_migration(mig, state)
+            return
+
         phone = me.phone if me else None
         if not phone:
             save_to_quarantine(chat_id, old_session_path, orig_name, "NO_PHONE: Не удалось получить номер")
@@ -1325,11 +1353,29 @@ async def process_one_session(item: dict, bot: Bot, state: FSMContext):
         )
 
         new_client = get_configured_client(new_session_path, mig.fingerprint, mig.proxy_config)
-        await asyncio.wait_for(new_client.connect(), timeout=8.0)
+        try:
+            await asyncio.wait_for(new_client.connect(), timeout=8.0)
+        except Exception as e:
+            logger.exception("new_client.connect() завис")
+            await reporter.update(
+                f"❌ Не удалось создать новую сессию: <code>{html.escape(str(e))}</code>",
+                force=True,
+            )
+            await cleanup_migration(mig, state)
+            return
         mig.new_client = new_client
 
         request_ts = int(time.time()) - 5
-        result = await new_client.send_code_request(phone)
+        try:
+            result = await asyncio.wait_for(new_client.send_code_request(phone), timeout=20.0)
+        except Exception as e:
+            logger.exception("send_code_request() завис")
+            await reporter.update(
+                f"❌ Telegram не отвечает на запрос кода: <code>{html.escape(str(e))}</code>",
+                force=True,
+            )
+            await cleanup_migration(mig, state)
+            return
         mig.phone_code_hash = result.phone_code_hash
         mig.last_activity = time.time()
 
